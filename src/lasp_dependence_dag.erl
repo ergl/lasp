@@ -18,6 +18,7 @@
 %% @todo Only export on test.
 -export([n_vertices/0,
          process_map/0,
+         child_map/0,
          n_edges/0,
          out_degree/1,
          in_degree/1,
@@ -48,9 +49,19 @@
 %% lets us quickly delete those edges.
 -type process_map() :: dict:dict(pid(), {id(), id()}).
 
+%% We store a mapping Parent -> [{child, read, transform, write}] to
+%% store the metadata.
+-record(child_map, {child :: id(),
+                    read :: function(),
+                    transform :: function(),
+                    write :: function()}).
+
+-type child_map() :: dict:dict(id(), list(#child_map{})).
+
 -record(state, {dag :: digraph:graph(),
                 process_map :: process_map(),
-                contraction_step :: non_neg_integer()}).
+                contraction_step :: non_neg_integer(),
+                child_map :: child_map()}).
 
 %% We store the function metadata as the edge label.
 -record(edge_label, {pid :: pid(),
@@ -138,6 +149,9 @@ in_edges(V) ->
 process_map() ->
     gen_server:call(?MODULE, get_process_map, infinity).
 
+child_map() ->
+    gen_server:call(?MODULE, get_child_map, infinity).
+
 %%%===================================================================
 %%% gen_server callbacks
 %%%===================================================================
@@ -146,7 +160,8 @@ process_map() ->
 init([]) ->
     {ok, #state{dag=digraph:new([acyclic]),
                 process_map=dict:new(),
-                contraction_step=0}}.
+                contraction_step=0,
+                child_map=dict:new()}}.
 
 -spec handle_call(term(), {pid(), term()}, #state{}) ->
     {reply, term(), #state{}}.
@@ -187,6 +202,9 @@ handle_call({export_dot, Path}, _From, #state{dag=Dag}=State) ->
 
 handle_call(get_process_map, _From, #state{process_map=PM}=State) ->
     {reply, {ok, dict:to_list(PM)}, State};
+
+handle_call(get_child_map, _From, #state{child_map=CM}=State) ->
+    {reply, {ok, dict:to_list(CM)}, State};
 
 %% @doc Check if linking the given vertices will introduce a cycle in the graph.
 %%
@@ -233,7 +251,7 @@ handle_call({will_form_cycle, From, To}, _From, #state{dag=Dag}=State) ->
 %%      We monitor all edge Pids to know when they die or get restarted.
 %%
 handle_call({add_edges, Src, Dst, Pid, ReadFuns, TransFun, {Dst, WriteFun}},
-            _From, #state{dag=Dag, process_map=Pm, contraction_step=CtStep}=State) ->
+            _From, #state{dag=Dag, process_map=Pm, contraction_step=CtStep, child_map=Cm}=State) ->
 
     %% @todo Should perform contractions at CONTRACTION_INTERVAL
     %%       and check for cleaving every time an edge is added.
@@ -260,13 +278,21 @@ handle_call({add_edges, Src, Dst, Pid, ReadFuns, TransFun, {Dst, WriteFun}},
         false ->
             erlang:monitor(process, Pid),
 
+
             %% For all V in Src, append Pid -> {V, Dst}
             %% in the process map.
             ProcessMap = lists:foldl(fun(El, D) ->
                 dict:append(Pid, {El, Dst}, D)
             end, Pm, Src),
 
-            {ok, State#state{process_map=ProcessMap}}
+            ChildMap = lists:foldl(fun(From, Acc) ->
+                dict:append(From,
+                            #child_map{child=Dst,
+                                       read=undefined,
+                                       transform=undefined,
+                                       write=undefined}, Acc)
+            end, Cm, Src),
+            {ok, State#state{process_map=ProcessMap, child_map=ChildMap}}
     end,
 
     St = case CtStep of
