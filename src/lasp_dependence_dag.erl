@@ -278,19 +278,21 @@ handle_call({add_edges, Src, Dst, Pid, ReadFuns, TransFun, {Dst, WriteFun}},
         false ->
             erlang:monitor(process, Pid),
 
-
             %% For all V in Src, append Pid -> {V, Dst}
             %% in the process map.
             ProcessMap = lists:foldl(fun(El, D) ->
                 dict:append(Pid, {El, Dst}, D)
             end, Pm, Src),
 
+            %% For all V in Src, append V -> {Child, Read, Trans, Write}
+            %% (where {Id, Read} = ReadFuns s.t. Id = V) in the child map.
             ChildMap = lists:foldl(fun(From, Acc) ->
+                Read = lists:nth(1, [ReadF || {Id, ReadF} <- ReadFuns, Id =:= From]),
                 dict:append(From,
                             #child_map{child=Dst,
-                                       read=undefined,
-                                       transform=undefined,
-                                       write=undefined}, Acc)
+                                       read=Read,
+                                       transform=TransFun,
+                                       write=WriteFun}, Acc)
             end, Cm, Src),
             {ok, State#state{process_map=ProcessMap, child_map=ChildMap}}
     end,
