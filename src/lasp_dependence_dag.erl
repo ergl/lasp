@@ -17,6 +17,7 @@
 %% Test
 %% @todo Only export on test.
 -export([n_vertices/0,
+         optimize_seq/1,
          process_map/0,
          child_map/0,
          n_edges/0,
@@ -117,6 +118,26 @@ will_form_cycle(Src, Dst) ->
 
 add_edges(Src, Dst, Pid, ReadFuns, TransFun, WriteFun) ->
     gen_server:call(?MODULE, {add_edges, Src, Dst, Pid, ReadFuns, TransFun, WriteFun}, infinity).
+
+%% @doc Link the first and last element of a list of vertices with a process.
+%%
+%%      @todo Just a limitation for testing purposes
+%%      The vertices in the list should be in topological order, and
+%%      shouldn't contain edges to any other vertex not in this list.
+%%      All vertices must have exactly one parent and one child.
+%%
+%%      If applied to a list [S1, S2, ..., SN], the resulting
+%%      process will take the read function from (S1, S2) and the write
+%%      function from (SN-1, SN).
+%%
+%%      The transforming function will be a composition of all the
+%%      transforming functions (S1, S2), (S2, S3), ...
+%%
+%%      See apply_sequentially/4 for more information.
+%%
+-spec optimize_seq(list(id())) -> ok.
+optimize_seq(VertexSeq) ->
+    gen_server:call(?MODULE, {optimize_seq, VertexSeq}, infinity).
 
 %% @doc Return the dot representation as a string.
 -spec to_dot() -> {ok, string()} | {error, no_data}.
@@ -308,7 +329,49 @@ handle_call({add_edges, Src, Dst, Pid, ReadFuns, TransFun, {Dst, WriteFun}},
         _ ->
             St0#state{contraction_step = CtStep + 1}
     end,
-    {reply, R, St}.
+    {reply, R, St};
+
+handle_call({optimize_seq, VSeq}, _From, #state{child_map=Cm}=State) ->
+    %% If the length of the list is <= 2, there's nothing to optimize.
+    case length(VSeq) of
+        N when N =< 2 -> ok;
+        _ ->
+            [First, Second | _] = VSeq,
+            SndLast = lists:nth(length(VSeq) - 1, VSeq),
+            Last = lists:nth(length(VSeq), VSeq),
+
+            %% Read function from the first vertex.
+            ReadFun = get_read_fun(First, Second, Cm),
+
+            %% Collection of all transforming functions.
+            TransFuns = collect_trans_funs(VSeq, Cm),
+
+            %% Write function from the lastvertex.
+            WriteFun = get_write_fun(SndLast, Last, Cm),
+
+            %% Since all transforming functions (with arity one) are
+            %% of type (CRDT -> value), we need an intermediate
+            %% function (value -> CRDT) to be able to compose them.
+            %%
+            %% The last function gets back the result from the last output.
+            %%
+            %% @todo Add support for multi-arity functions
+            %% @todo Add support for delta functions (see core map)
+            TransFun = fun({_, T, _, _}=X) ->
+                apply_sequentially(X, TransFuns, fun(V) ->
+                    {ignore, T, ignore, V}
+                end, fun({_, _, _, V}) ->  V  end)
+            end,
+
+            %% Create the new edge in a separate process, since we are blocking
+            %% @todo kill other processes and mark as optimized
+            spawn(fun() ->
+                lasp_process:start_dag_link([[{First, ReadFun}],
+                                             TransFun,
+                                             {Last, WriteFun}])
+            end)
+    end,
+    {reply, ok, State}.
 
 %% @private
 -spec handle_cast(term(), #state{}) -> {noreply, #state{}}.
@@ -507,6 +570,65 @@ maybe_unnecessary(_G, V) when is_pid(V) ->
 
 maybe_unnecessary(G, V) ->
     digraph:in_degree(G, V) =:= 1.
+
+%% @doc Thread a value through a list of functions.
+%%
+%%      Takes an initial value, a list of functions,
+%%      and two transforming functions.
+%%
+%%      The first one transforms the output of a function
+%%      into the input of the next one in the list.
+%%
+%%      The second one transforms the output of the final
+%%      function in the list.
+%%
+%%      When Int and Final are the identity function,
+%%      apply_sequentially is equivalent to applying X
+%%      to the composition of all functions in the list.
+%%
+-spec apply_sequentially(any(), list(function()), function(), function()) -> any().
+apply_sequentially(X, [], _, Final) -> Final(X);
+apply_sequentially(X, [H | T], Int, Final) ->
+    apply_sequentially(Int(H(X)), T, Int, Final).
+
+%% @doc Collect the transforming functions linking a list of vertices.
+collect_trans_funs([_ | T]=Seq, Cm) ->
+    zipwith(fun(Src, Dst) ->
+        get_trans_fun(Src, Dst, Cm)
+    end, Seq, T).
+
+%% @doc Zipwith that works with lists of different length.
+%%
+%%      Stops as soon as one of the lists is empty.
+%%
+%%      zipwith(fun(X, Y) -> {X, Y} end, [1,2,3], [1,2]).
+%%      => [{1,1}, {2,2}]
+%%
+-spec zipwith(function(), list(any()), list(any())) -> list(any()).
+zipwith(Fn, [X | Xs], [Y | Ys]) ->
+    [Fn(X, Y) | zipwith(Fn, Xs, Ys)];
+
+zipwith(Fn, _, _) when is_function(Fn, 2) -> [].
+
+%% @doc Get the read function between V1 and V2.
+get_read_fun(V1, V2, Cm) ->
+    get_property(fun(X) -> X#child_map.read end, V1, V2, Cm).
+
+%% @doc Get the transforming function between V1 and V2.
+get_trans_fun(V1, V2, Cm) ->
+    get_property(fun(X) -> X#child_map.transform end, V1, V2, Cm).
+
+%% @doc Get the write function between V1 and V2.
+get_write_fun(V1, V2, Cm) ->
+    get_property(fun(X) -> X#child_map.write end, V1, V2, Cm).
+
+%% @doc Apply Fn to the properties linking V1 and V2.
+get_property(Fn, V1, V2, Cm) ->
+    {ok, Match} = dict:find(V1, Cm),
+    Info = lists:nth(1, lists:filter(fun(Rec) ->
+        Rec#child_map.child =:= V2
+    end, Match)),
+    Fn(Info).
 
 %%%===================================================================
 %%% .DOT export functions
